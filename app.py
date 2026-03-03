@@ -251,6 +251,17 @@ branch = st.secrets.get("GITHUB_BRANCH", "main")
 path = st.secrets.get("GITHUB_FILE_PATH", "data/latest.xlsx")
 
 if admin_ok:
+    st.sidebar.markdown("### 🧪 Диагностика GitHub")
+    if st.sidebar.button("Проверить доступ к репозиторию"):
+        r = requests.get(f"https://api.github.com/repos/{repo}", headers=gh_headers(), timeout=30)
+        st.sidebar.write("GET /repos status:", r.status_code)
+        st.sidebar.write(r.text[:500])
+
+    if st.sidebar.button("Проверить ветку"):
+        r = requests.get(f"https://api.github.com/repos/{repo}/branches/{branch}", headers=gh_headers(), timeout=30)
+        st.sidebar.write("GET /branches status:", r.status_code)
+        st.sidebar.write(r.text[:500])
+if admin_ok:
     st.subheader("⬆️ Обновить расписание (видно всем по ссылке)")
     new_file = st.file_uploader("Загрузите новый Excel (.xlsx) для публикации", type=["xlsx"], key="admin_uploader")
     if new_file and st.button("Опубликовать"):
@@ -344,3 +355,4 @@ for (date_str, day), chunk in view2.groupby(["Дата_str", "День"], sort=F
 
 csv = view.to_csv(index=False, encoding="utf-8-sig")
 st.download_button("⬇️ Скачать выбранное (CSV)", data=csv, file_name="schedule_filtered.csv", mime="text/csv")
+
