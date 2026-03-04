@@ -5,7 +5,7 @@ import re
 import requests
 import base64
 from io import BytesIO
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import uuid
 
@@ -15,6 +15,15 @@ TZ = ZoneInfo("Europe/Berlin")
 st.set_page_config(page_title="Расписание", layout="wide")
 st.title("📅 Расписание")
 
+# ---------- simple mobile detection ----------
+def detect_mobile() -> bool:
+    # Streamlit doesn't expose UA reliably. We'll default to user toggle.
+    return False
+
+if "ui_mobile" not in st.session_state:
+    st.session_state["ui_mobile"] = detect_mobile()
+
+# -------------------- Styles --------------------
 st.markdown("""
 <style>
 .block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1200px; }
@@ -37,7 +46,8 @@ st.markdown("""
 }
 .muted { opacity: 0.78; }
 hr.soft { border: none; border-top: 1px solid rgba(49, 51, 63, 0.15); margin: 12px 0; }
-.smallcap { font-size: 0.88rem; opacity: 0.8; }
+.smallcap { font-size: 0.88rem; opacity: 0.82; }
+.bigbtn button { width: 100%; height: 3.1rem; font-size: 1.05rem; border-radius: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -169,8 +179,7 @@ def get_pair_times_for_day(day_name: str) -> dict[int, tuple[str, str]]:
         return monday
     if "СУБ" in d:
         return saturday
-    # Вт–Пт (и fallback)
-    return tue_fri
+    return tue_fri  # Вт–Пт (и fallback)
 
 def parse_hhmm(s: str) -> time:
     hh, mm = s.strip().split(":")
@@ -196,7 +205,6 @@ def make_ics(df_view: pd.DataFrame) -> str:
         lines.append("END:VCALENDAR")
         return "\r\n".join(lines)
 
-    # Ensure types
     tmp = df_view.copy()
     tmp = tmp.sort_values(["Дата", "Пара", "Лист", "Группа"])
 
@@ -246,7 +254,7 @@ def make_ics(df_view: pd.DataFrame) -> str:
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines)
 
-# -------------------- Parsing (your formats) --------------------
+# -------------------- Parsing --------------------
 def _clean_str(x) -> str:
     if pd.isna(x):
         return ""
@@ -405,8 +413,8 @@ def parse_all_sheets(xlsx_file) -> pd.DataFrame:
     out = out.sort_values(["Дата", "Пара", "Лист", "Группа"]).reset_index(drop=True)
     return out
 
-# -------------------- Render helpers --------------------
-def render_day_cards(df_day: pd.DataFrame):
+# -------------------- UI render --------------------
+def render_day_cards(df_day: pd.DataFrame, compact: bool):
     df_day = df_day.sort_values(["Дата", "Пара", "Лист", "Группа"])
     df_day["Дата_str"] = df_day["Дата"].dt.strftime("%d.%m.%Y")
 
@@ -427,22 +435,39 @@ def render_day_cards(df_day: pd.DataFrame):
             start_s, end_s = pair_times.get(pair, ("", ""))
             time_part = f"{start_s}–{end_s}" if start_s else ""
 
-            st.markdown(
-                f"""
-                <div class="rowline">
-                  <span class="badge">{pair} пара</span>
-                  <span class="muted"> {time_part}</span>
-                  <span class="muted"> · </span>
-                  <b>{row.get('Лист','')}</b> / <b>{row.get('Группа','')}</b>
-                  <span class="muted"> · </span>
-                  {row.get('Дисциплина','')}
-                  <br/>
-                  <span class="muted">{row.get('Преподаватель','')}</span>
-                  <span class="muted"> · ауд.</span> {row.get('Аудитория','')}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+            if compact:
+                st.markdown(
+                    f"""
+                    <div class="rowline">
+                      <span class="badge">{pair}</span>
+                      <span class="muted">{time_part}</span>
+                      <span class="muted"> · </span>
+                      <b>{row.get('Группа','')}</b>
+                      <span class="muted"> · </span>
+                      {row.get('Дисциплина','')}
+                      <span class="muted"> · </span>
+                      ауд. {row.get('Аудитория','')}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div class="rowline">
+                      <span class="badge">{pair} пара</span>
+                      <span class="muted"> {time_part}</span>
+                      <span class="muted"> · </span>
+                      <b>{row.get('Лист','')}</b> / <b>{row.get('Группа','')}</b>
+                      <span class="muted"> · </span>
+                      {row.get('Дисциплина','')}
+                      <br/>
+                      <span class="muted">{row.get('Преподаватель','')}</span>
+                      <span class="muted"> · ауд.</span> {row.get('Аудитория','')}
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -453,11 +478,11 @@ repo = st.secrets.get("GITHUB_REPO", "")
 branch = st.secrets.get("GITHUB_BRANCH", "main")
 path = st.secrets.get("GITHUB_FILE_PATH", "data/latest.xlsx")
 
-# Header info
-c_hdr1, c_hdr2 = st.columns([3, 2])
+# Top line: help + updated
+c_hdr1, c_hdr2, c_hdr3 = st.columns([3, 2, 1.4])
 
 with c_hdr1:
-    st.markdown('<div class="smallcap">Откройте ссылку — расписание уже будет показано. '
+    st.markdown('<div class="smallcap">Откройте ссылку — расписание будет показано автоматически. '
                 'Админ обновляет файл через панель слева.</div>', unsafe_allow_html=True)
 
 with c_hdr2:
@@ -466,13 +491,16 @@ with c_hdr2:
         if dt_utc:
             dt_local_show = dt_utc.astimezone(TZ)
             st.markdown(
-                f'<div class="smallcap" style="text-align:right;">🕒 Обновлено: <b>{dt_local_show.strftime("%d.%m.%Y %H:%M")}</b></div>',
+                f'<div class="smallcap">🕒 Обновлено: <b>{dt_local_show.strftime("%d.%m.%Y %H:%M")}</b></div>',
                 unsafe_allow_html=True
             )
     except Exception:
         pass
 
-# Admin upload
+with c_hdr3:
+    st.session_state["ui_mobile"] = st.toggle("📱 Мобильный режим", value=st.session_state["ui_mobile"])
+
+# Admin upload (sidebar)
 if admin_ok:
     st.sidebar.markdown("### ⬆️ Обновить расписание")
     new_file = st.sidebar.file_uploader("Загрузите Excel (.xlsx)", type=["xlsx"], key="admin_uploader")
@@ -492,7 +520,7 @@ if admin_ok:
         except Exception as e:
             st.sidebar.error(f"Ошибка публикации: {e}")
 
-# Load published schedule
+# Load schedule
 st.markdown("### 📄 Текущее расписание")
 
 try:
@@ -504,43 +532,120 @@ except Exception as e:
     st.caption(f"Детали: {e}")
     st.stop()
 
+# Prepare "my teacher" / quick actions
+today_local = datetime.now(TZ).date()
+tomorrow_local = today_local + timedelta(days=1)
+
+if "quick_mode" not in st.session_state:
+    st.session_state["quick_mode"] = "all"  # all | today | tomorrow | my_today | my_tomorrow
+if "my_teacher" not in st.session_state:
+    st.session_state["my_teacher"] = ""
+
+teachers_all = sorted([t for t in df["Преподаватель"].unique().tolist() if str(t).strip()])
+
+with st.sidebar:
+    st.markdown("### 🙋 Мой преподаватель")
+    # allow typing and matching
+    typed = st.text_input("Введите фамилию/имя (поиск)", value=st.session_state["my_teacher"])
+    # find best matches (contains)
+    typed_l = typed.strip().lower()
+    candidates = teachers_all
+    if typed_l:
+        candidates = [t for t in teachers_all if typed_l in t.lower()]
+    # if candidates too many, keep first 50
+    candidates = candidates[:50] if len(candidates) > 50 else candidates
+    chosen = st.selectbox("Выберите из списка", options=[""] + candidates, index=0)
+    if st.button("💾 Сохранить моего преподавателя"):
+        st.session_state["my_teacher"] = chosen if chosen else typed
+        st.success("Сохранено для текущей сессии")
+
 st.success(f"Записей: {len(df)} | Листов: {df['Лист'].nunique()}")
 
-# Quick: Today
-today_local = datetime.now(TZ).date()
-if "date_quick_mode" not in st.session_state:
-    st.session_state["date_quick_mode"] = "all"  # all | today
+# Quick buttons row (bigger on mobile)
+btn_class = "bigbtn" if st.session_state["ui_mobile"] else ""
+b1, b2, b3, b4, b5 = st.columns([1.2, 1.2, 1.7, 1.7, 1.2])
 
-qb1, qb2, qb3 = st.columns([1.2, 1.0, 8.0])
-if qb1.button("📍 Сегодня"):
-    st.session_state["date_quick_mode"] = "today"
-if qb2.button("♻️ Сброс"):
-    st.session_state["date_quick_mode"] = "all"
+with b1:
+    st.markdown(f'<div class="{btn_class}">', unsafe_allow_html=True)
+    if st.button("📍 Сегодня"):
+        st.session_state["quick_mode"] = "today"
+    st.markdown('</div>', unsafe_allow_html=True)
 
-if st.session_state["date_quick_mode"] == "today":
-    st.info(f"Показаны занятия только за сегодня: {today_local.strftime('%d.%m.%Y')}")
+with b2:
+    st.markdown(f'<div class="{btn_class}">', unsafe_allow_html=True)
+    if st.button("➡️ Завтра"):
+        st.session_state["quick_mode"] = "tomorrow"
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# Filters
-col1, col2, col3, col4 = st.columns([1.4, 1.7, 2.6, 2.6])
-mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
+with b3:
+    st.markdown(f'<div class="{btn_class}">', unsafe_allow_html=True)
+    if st.button("🙋 Мои пары сегодня"):
+        st.session_state["quick_mode"] = "my_today"
+    st.markdown('</div>', unsafe_allow_html=True)
 
-days = sorted([d for d in df["День"].unique().tolist() if d])
-day_filter = col2.multiselect("Дни недели", options=days, default=[])
+with b4:
+    st.markdown(f'<div class="{btn_class}">', unsafe_allow_html=True)
+    if st.button("🙋 Мои пары завтра"):
+        st.session_state["quick_mode"] = "my_tomorrow"
+    st.markdown('</div>', unsafe_allow_html=True)
 
-sheets = sorted(df["Лист"].unique().tolist())
-sheet_filter = col3.multiselect("Листы", options=sheets, default=sheets)
+with b5:
+    st.markdown(f'<div class="{btn_class}">', unsafe_allow_html=True)
+    if st.button("♻️ Сброс"):
+        st.session_state["quick_mode"] = "all"
+    st.markdown('</div>', unsafe_allow_html=True)
 
-query = col4.text_input("Поиск (фамилия / предмет / аудитория / группа)")
+# Filters layout: compact in mobile
+if st.session_state["ui_mobile"]:
+    col1, col2 = st.columns([1.2, 2.2])
+    mode = col1.selectbox("Режим", ["Всё", "По преподавателю", "По группе"])
+    query = col2.text_input("Поиск (фамилия / предмет / ауд.)")
+    # Sheets and day filters go to expander
+    with st.expander("Фильтры (дни / листы)"):
+        days = sorted([d for d in df["День"].unique().tolist() if d])
+        day_filter = st.multiselect("Дни недели", options=days, default=[])
+        sheets = sorted(df["Лист"].unique().tolist())
+        sheet_filter = st.multiselect("Листы", options=sheets, default=sheets)
+else:
+    col1, col2, col3, col4 = st.columns([1.4, 1.7, 2.6, 2.6])
+    mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
+    days = sorted([d for d in df["День"].unique().tolist() if d])
+    day_filter = col2.multiselect("Дни недели", options=days, default=[])
+    sheets = sorted(df["Лист"].unique().tolist())
+    sheet_filter = col3.multiselect("Листы", options=sheets, default=sheets)
+    query = col4.text_input("Поиск (фамилия / предмет / аудитория / группа)")
 
+# Apply filters + quick modes
 view = df.copy()
 
-if st.session_state["date_quick_mode"] == "today":
-    view = view[view["Дата"].dt.date == today_local]
+def apply_date_filter(frame: pd.DataFrame, which: str) -> pd.DataFrame:
+    if which == "today":
+        return frame[frame["Дата"].dt.date == today_local]
+    if which == "tomorrow":
+        return frame[frame["Дата"].dt.date == tomorrow_local]
+    return frame
 
-if day_filter:
+qm = st.session_state["quick_mode"]
+
+if qm in ("today", "tomorrow"):
+    view = apply_date_filter(view, qm)
+
+if qm in ("my_today", "my_tomorrow"):
+    myt = (st.session_state.get("my_teacher") or "").strip()
+    if not myt:
+        st.warning("Сначала выберите и сохраните 'Мой преподаватель' в боковой панели.")
+        # still show all, but no my-filter
+    else:
+        view = view[view["Преподаватель"].astype(str).str.strip() == myt]
+        view = apply_date_filter(view, "today" if qm == "my_today" else "tomorrow")
+
+# day/sheet filters
+if 'day_filter' in locals() and day_filter:
     view = view[view["День"].isin(day_filter)]
-if sheet_filter:
+if 'sheet_filter' in locals() and sheet_filter:
     view = view[view["Лист"].isin(sheet_filter)]
+
+# query filter
 if query.strip():
     q = query.strip().lower()
     mask = (
@@ -552,65 +657,52 @@ if query.strip():
     )
     view = view[mask]
 
+# mode-specific selection
 if mode == "По преподавателю":
-    teachers = sorted([t for t in view["Преподаватель"].unique().tolist() if t])
+    teachers = sorted([t for t in view["Преподаватель"].unique().tolist() if str(t).strip()])
     teacher = st.selectbox("Преподаватель", options=teachers)
     view = view[view["Преподаватель"] == teacher]
 elif mode == "По группе":
-    groups = sorted([g for g in view["Группа"].unique().tolist() if g])
+    groups = sorted([g for g in view["Группа"].unique().tolist() if str(g).strip()])
     group = st.selectbox("Группа", options=groups)
     view = view[view["Группа"] == group]
+elif mode == "Всё":
+    pass
 
-# Tabs
+# Tabs: on mobile default to Days
 tab_days, tab_table, tab_cal = st.tabs(["📅 По дням", "📋 Таблица", "🗓️ Календарь"])
 
 with tab_days:
     if view.empty:
         st.info("Ничего не найдено по выбранным фильтрам.")
     else:
-        render_day_cards(view)
+        # Compact cards on mobile
+        render_day_cards(view, compact=st.session_state["ui_mobile"])
 
 with tab_table:
     show = view.copy()
     show["Дата"] = show["Дата"].dt.strftime("%d.%m.%Y")
+    # On mobile show fewer columns
+    if st.session_state["ui_mobile"]:
+        cols = ["Дата", "День", "Пара", "Группа", "Дисциплина", "Аудитория"]
+    else:
+        cols = ["Лист", "Дата", "День", "Пара", "Группа", "Дисциплина", "Преподаватель", "Аудитория"]
+
     st.dataframe(
-        show[["Лист", "Дата", "День", "Пара", "Группа", "Дисциплина", "Преподаватель", "Аудитория"]],
+        show[cols],
         use_container_width=True,
         hide_index=True
     )
 
 with tab_cal:
     st.write("Скачайте календарь и импортируйте в Google Calendar / Outlook.")
-    st.caption("Экспорт учитывает текущие фильтры (например: только ваш преподаватель, только 'Сегодня', выбранные листы).")
+    st.caption("Экспорт учитывает текущие фильтры (включая 'Мои пары сегодня/завтра').")
 
-    with st.expander("⏱️ Расписание пар (как используется в ICS)"):
+    with st.expander("⏱️ Расписание пар (используется в ICS)"):
         st.markdown("""
-**Понедельник:**
-1) 09:00–10:10  
-2) 10:20–11:30  
-3) 11:50–13:00  
-4) 13:10–14:20  
-5) 14:30–15:30  
-6) 16:00–17:10  
-7) 17:20–18:30  
-
-**Вторник–Пятница:**
-1) 09:00–10:10  
-2) 10:20–11:30  
-3) 11:50–13:00  
-4) 13:10–14:20  
-5) 14:30–15:30  
-6) 15:50–17:00  
-7) 17:10–18:20  
-
-**Суббота:**
-1) 09:00–10:00  
-2) 10:10–11:10  
-3) 11:30–12:30  
-4) 12:40–13:40  
-5) 13:50–14:50  
-6) 15:00–16:00  
-7) 16:10–17:10
+**Понедельник:** 1) 09:00–10:10 · 2) 10:20–11:30 · 3) 11:50–13:00 · 4) 13:10–14:20 · 5) 14:30–15:30 · 6) 16:00–17:10 · 7) 17:20–18:30  
+**Вт–Пт:** 1) 09:00–10:10 · 2) 10:20–11:30 · 3) 11:50–13:00 · 4) 13:10–14:20 · 5) 14:30–15:30 · 6) 15:50–17:00 · 7) 17:10–18:20  
+**Суббота:** 1) 09:00–10:00 · 2) 10:10–11:10 · 3) 11:30–12:30 · 4) 12:40–13:40 · 5) 13:50–14:50 · 6) 15:00–16:00 · 7) 16:10–17:10
         """)
 
 # Downloads
