@@ -17,7 +17,6 @@ st.title("📅 Расписание")
 
 # ---------- simple mobile detection ----------
 def detect_mobile() -> bool:
-    # Streamlit doesn't expose UA reliably. We'll default to user toggle.
     return False
 
 if "ui_mobile" not in st.session_state:
@@ -143,7 +142,7 @@ def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str):
     dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     return dt_utc
 
-# -------------------- Pair schedule (your rules) --------------------
+# -------------------- Pair schedule --------------------
 def get_pair_times_for_day(day_name: str) -> dict[int, tuple[str, str]]:
     d = (day_name or "").strip().upper()
 
@@ -179,7 +178,7 @@ def get_pair_times_for_day(day_name: str) -> dict[int, tuple[str, str]]:
         return monday
     if "СУБ" in d:
         return saturday
-    return tue_fri  # Вт–Пт (и fallback)
+    return tue_fri
 
 def parse_hhmm(s: str) -> time:
     hh, mm = s.strip().split(":")
@@ -205,8 +204,7 @@ def make_ics(df_view: pd.DataFrame) -> str:
         lines.append("END:VCALENDAR")
         return "\r\n".join(lines)
 
-    tmp = df_view.copy()
-    tmp = tmp.sort_values(["Дата", "Пара", "Лист", "Группа"])
+    tmp = df_view.copy().sort_values(["Дата", "Пара", "Группа", "Подгруппа"])
 
     for _, row in tmp.iterrows():
         d = row["Дата"].date() if hasattr(row["Дата"], "date") else pd.to_datetime(row["Дата"]).date()
@@ -222,20 +220,22 @@ def make_ics(df_view: pd.DataFrame) -> str:
         dtstart = dt_local(d, start_t).strftime("%Y%m%dT%H%M%S")
         dtend = dt_local(d, end_t).strftime("%Y%m%dT%H%M%S")
 
-        summary = f"{row.get('Дисциплина','')}"
-        location = f"{row.get('Аудитория','')}".strip()
+        summary = f"{row.get('Дисциплина', '')}"
+        location = f"{row.get('Аудитория', '')}".strip()
 
         desc_parts = []
         if row.get("Преподаватель"):
             desc_parts.append(f"Преподаватель: {row.get('Преподаватель')}")
         if row.get("Группа"):
             desc_parts.append(f"Группа: {row.get('Группа')}")
-        if row.get("Лист"):
-            desc_parts.append(f"Лист: {row.get('Лист')}")
+        if row.get("Подгруппа"):
+            desc_parts.append(f"Подгруппа: {row.get('Подгруппа')}")
+        if row.get("Источник"):
+            desc_parts.append(f"Источник: {row.get('Источник')}")
         if location:
             desc_parts.append(f"Аудитория: {location}")
-        description = "\n".join(desc_parts)
 
+        description = "\n".join(desc_parts)
         uid = str(uuid.uuid4()) + "@schedule-app"
 
         lines.extend([
@@ -254,15 +254,19 @@ def make_ics(df_view: pd.DataFrame) -> str:
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines)
 
-# -------------------- Parsing --------------------
+# -------------------- Parsing uploaded schedules --------------------
 def _clean_str(x) -> str:
     if pd.isna(x):
         return ""
     s = str(x).strip()
     return "" if s.lower() == "nan" else s
 
-def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
-    raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
+def parse_weekly_blocks_format(xlsx_file, source_name="") -> pd.DataFrame:
+    """
+    Формат A:
+    Дата | День недели | Занятие | [Дисциплина, Преподаватель, Ауд., Группа]...
+    """
+    raw = pd.read_excel(xlsx_file, header=None)
 
     header_row = None
     for r in range(min(15, len(raw))):
@@ -271,7 +275,7 @@ def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
             header_row = r
             break
     if header_row is None:
-        raise ValueError("Не нашёл строку заголовков (Дата/День недели/Занятие).")
+        raise ValueError("Не найден недельный формат")
 
     header = raw.iloc[header_row].tolist()
     data = raw.iloc[header_row + 1:].copy()
@@ -301,41 +305,51 @@ def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
         for c in ["Преподаватель", "Аудитория", "Группа"]:
             temp[c] = temp[c].replace({np.nan: ""}).astype(str)
 
+        temp["Подгруппа"] = ""
+        temp["Источник"] = source_name
         result.append(temp)
+
+    if not result:
+        raise ValueError("Не удалось прочитать недельный формат")
 
     out = pd.concat(result, ignore_index=True)
     out = out.sort_values(["Дата", "Пара", "Группа"]).reset_index(drop=True)
     return out
 
-def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
-    raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
+def parse_official_wide_format(xlsx_file, source_name="") -> pd.DataFrame:
+    """
+    Формат B:
+    День недели | Занятие | Урок | Время | ... блоки групп ...
+    Широкая официальная форма.
+    """
+    raw = pd.read_excel(xlsx_file, header=None)
 
     header_row = None
-    for r in range(min(12, len(raw))):
+    for r in range(min(20, len(raw))):
         row = raw.iloc[r].astype(str).tolist()
-        if ("День недели" in row) and ("Занятие" in row):
+        if ("День недели" in row) and ("Занятие" in row) and ("Урок" in row):
             header_row = r
             break
     if header_row is None:
-        raise ValueError("Не нашёл шапку (строку с 'День недели' и 'Занятие').")
+        raise ValueError("Не найден широкий формат")
 
-    groups_row = header_row + 2
+    group_row = header_row + 2
+    subgroup_row = header_row + 3
     row0 = raw.iloc[header_row].tolist()
 
     disc_cols = [i for i, v in enumerate(row0) if str(v).strip() == "Дисциплина"]
     if not disc_cols:
-        raise ValueError("Не нашёл колонки 'Дисциплина' (блоки групп).")
+        raise ValueError("Не найдены блоки 'Дисциплина'")
 
     aud_cols = {d: d + 3 for d in disc_cols if d + 3 < raw.shape[1]}
 
     group_names = {}
-    if groups_row < len(raw):
-        for d in disc_cols:
-            g = _clean_str(raw.iloc[groups_row, d])
-            group_names[d] = g if g else f"Группа_{d}"
-    else:
-        for d in disc_cols:
-            group_names[d] = f"Группа_{d}"
+    subgroup_names = {}
+    for d in disc_cols:
+        g = _clean_str(raw.iloc[group_row, d]) if group_row < len(raw) else ""
+        sg = _clean_str(raw.iloc[subgroup_row, d]) if subgroup_row < len(raw) else ""
+        group_names[d] = g
+        subgroup_names[d] = sg
 
     records = []
     current_date = None
@@ -345,34 +359,37 @@ def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
     r = start_row
 
     while r < len(raw) - 1:
-        s0 = _clean_str(raw.iloc[r, 0])
-        m = re.match(r"(\d{2}\.\d{2}\.\d{4})\s*(.*)", s0)
+        first_cell = _clean_str(raw.iloc[r, 0])
+
+        m = re.match(r"(\d{2}\.\d{2}\.\d{4})\s*(.*)", first_cell)
         if m:
             current_date = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
             current_day = m.group(2).strip()
 
-        pair = pd.to_numeric(raw.iloc[r, 1], errors="coerce")
-        if pd.notna(pair) and current_date is not None:
-            pair = int(pair)
+        pair_candidate = pd.to_numeric(raw.iloc[r, 1], errors="coerce")
+
+        if pd.notna(pair_candidate) and current_date is not None:
+            current_pair = int(pair_candidate)
             teacher_row = r + 1
 
             for d in disc_cols:
                 discipline = _clean_str(raw.iloc[r, d])
-                if not discipline:
-                    continue
+                teacher = _clean_str(raw.iloc[teacher_row, d]) if teacher_row < len(raw) else ""
+                aud = _clean_str(raw.iloc[r, aud_cols.get(d, d)]) if d in aud_cols else ""
 
-                teacher = _clean_str(raw.iloc[teacher_row, d])
-                aud_col = aud_cols.get(d, None)
-                aud = _clean_str(raw.iloc[r, aud_col]) if aud_col is not None else ""
+                if not discipline and not teacher and not aud:
+                    continue
 
                 records.append({
                     "Дата": current_date,
                     "День": current_day,
-                    "Пара": pair,
-                    "Группа": group_names.get(d, ""),
+                    "Пара": current_pair,
                     "Дисциплина": discipline,
                     "Преподаватель": teacher,
-                    "Аудитория": aud
+                    "Аудитория": aud,
+                    "Группа": group_names.get(d, ""),
+                    "Подгруппа": subgroup_names.get(d, ""),
+                    "Источник": source_name
                 })
 
             r += 2
@@ -381,41 +398,98 @@ def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
         r += 1
 
     if not records:
-        raise ValueError("Не удалось собрать записи (возможно, на листе другая структура).")
+        raise ValueError("Не удалось прочитать широкий формат")
 
     out = pd.DataFrame(records)
-    out = out.sort_values(["Дата", "Пара", "Группа"]).reset_index(drop=True)
+
+    for c in ["Дисциплина", "Преподаватель", "Аудитория", "Группа", "Подгруппа", "Источник", "День"]:
+        out[c] = out[c].astype(str).replace("nan", "").str.strip()
+
+    out = out[out["Дисциплина"].str.strip() != ""]
+    out = out.sort_values(["Дата", "Пара", "Группа", "Подгруппа"]).reset_index(drop=True)
     return out
 
-def parse_any_sheet(xlsx_file, sheet) -> pd.DataFrame:
-    try:
-        return parse_general_college_format(xlsx_file, sheet=sheet)
-    except Exception:
-        return parse_weekly_blocks_format(xlsx_file, sheet=sheet)
+def parse_single_uploaded_schedule(file_obj) -> pd.DataFrame:
+    source_name = getattr(file_obj, "name", "uploaded.xlsx")
 
-def parse_all_sheets(xlsx_file) -> pd.DataFrame:
-    xls = pd.ExcelFile(xlsx_file)
+    try:
+        file_obj.seek(0)
+        return parse_official_wide_format(file_obj, source_name=source_name)
+    except Exception:
+        pass
+
+    try:
+        file_obj.seek(0)
+        return parse_weekly_blocks_format(file_obj, source_name=source_name)
+    except Exception:
+        pass
+
+    raise ValueError(f"Не удалось распознать формат файла: {source_name}")
+
+def parse_multiple_uploaded_schedules(uploaded_files):
     parts = []
-    for sh in xls.sheet_names:
+    errors = []
+
+    for f in uploaded_files:
         try:
-            part = parse_any_sheet(xlsx_file, sheet=sh)
-            part["Лист"] = sh
+            f.seek(0)
+            part = parse_single_uploaded_schedule(f)
             parts.append(part)
-        except Exception:
-            continue
+        except Exception as e:
+            errors.append(f"{getattr(f, 'name', 'file')}: {e}")
 
     if not parts:
-        raise ValueError("Не удалось распарсить ни один лист (возможно, другой формат файла).")
+        raise ValueError("Не удалось распарсить ни один файл")
 
     out = pd.concat(parts, ignore_index=True)
-    for c in ["День", "Группа", "Дисциплина", "Преподаватель", "Аудитория", "Лист"]:
+
+    for c in ["День", "Группа", "Подгруппа", "Дисциплина", "Преподаватель", "Аудитория", "Источник"]:
         out[c] = out[c].astype(str).replace("nan", "").str.strip()
-    out = out.sort_values(["Дата", "Пара", "Лист", "Группа"]).reset_index(drop=True)
-    return out
+
+    out["Пара"] = pd.to_numeric(out["Пара"], errors="coerce")
+    out["Дата"] = pd.to_datetime(out["Дата"], errors="coerce")
+    out = out.dropna(subset=["Дата", "Пара"])
+
+    out = out.drop_duplicates(subset=[
+        "Дата", "День", "Пара", "Группа", "Подгруппа",
+        "Дисциплина", "Преподаватель", "Аудитория"
+    ])
+
+    out = out.sort_values(["Дата", "Пара", "Группа", "Подгруппа"]).reset_index(drop=True)
+    return out, errors
+
+# -------------------- Loading published data --------------------
+def load_published_schedule(repo: str, branch: str):
+    json_url = gh_raw_url(repo, branch, "data/latest.json")
+    try:
+        raw_json = download_bytes(json_url)
+        df = pd.read_json(BytesIO(raw_json))
+        df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce")
+        df["Пара"] = pd.to_numeric(df["Пара"], errors="coerce")
+        for c in ["День", "Группа", "Подгруппа", "Дисциплина", "Преподаватель", "Аудитория", "Источник"]:
+            if c not in df.columns:
+                df[c] = ""
+            df[c] = df[c].astype(str).replace("nan", "").str.strip()
+        df = df.dropna(subset=["Дата", "Пара"])
+        return df
+    except Exception:
+        pass
+
+    xlsx_url = gh_raw_url(repo, branch, "data/latest.xlsx")
+    raw_xlsx = download_bytes(xlsx_url)
+    df = pd.read_excel(BytesIO(raw_xlsx), sheet_name="schedule")
+    df["Дата"] = pd.to_datetime(df["Дата"], errors="coerce")
+    df["Пара"] = pd.to_numeric(df["Пара"], errors="coerce")
+    for c in ["День", "Группа", "Подгруппа", "Дисциплина", "Преподаватель", "Аудитория", "Источник"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].astype(str).replace("nan", "").str.strip()
+    df = df.dropna(subset=["Дата", "Пара"])
+    return df
 
 # -------------------- UI render --------------------
 def render_day_cards(df_day: pd.DataFrame, compact: bool):
-    df_day = df_day.sort_values(["Дата", "Пара", "Лист", "Группа"])
+    df_day = df_day.sort_values(["Дата", "Пара", "Группа", "Подгруппа"])
     df_day["Дата_str"] = df_day["Дата"].dt.strftime("%d.%m.%Y")
 
     for (date_str, day), chunk in df_day.groupby(["Дата_str", "День"], sort=False):
@@ -435,6 +509,8 @@ def render_day_cards(df_day: pd.DataFrame, compact: bool):
             start_s, end_s = pair_times.get(pair, ("", ""))
             time_part = f"{start_s}–{end_s}" if start_s else ""
 
+            subgroup_part = f" / {row.get('Подгруппа', '')}" if str(row.get("Подгруппа", "")).strip() else ""
+
             if compact:
                 st.markdown(
                     f"""
@@ -442,11 +518,11 @@ def render_day_cards(df_day: pd.DataFrame, compact: bool):
                       <span class="badge">{pair}</span>
                       <span class="muted">{time_part}</span>
                       <span class="muted"> · </span>
-                      <b>{row.get('Группа','')}</b>
+                      <b>{row.get('Группа', '')}{subgroup_part}</b>
                       <span class="muted"> · </span>
-                      {row.get('Дисциплина','')}
+                      {row.get('Дисциплина', '')}
                       <span class="muted"> · </span>
-                      ауд. {row.get('Аудитория','')}
+                      ауд. {row.get('Аудитория', '')}
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -458,12 +534,12 @@ def render_day_cards(df_day: pd.DataFrame, compact: bool):
                       <span class="badge">{pair} пара</span>
                       <span class="muted"> {time_part}</span>
                       <span class="muted"> · </span>
-                      <b>{row.get('Лист','')}</b> / <b>{row.get('Группа','')}</b>
+                      <b>{row.get('Группа', '')}{subgroup_part}</b>
                       <span class="muted"> · </span>
-                      {row.get('Дисциплина','')}
+                      {row.get('Дисциплина', '')}
                       <br/>
-                      <span class="muted">{row.get('Преподаватель','')}</span>
-                      <span class="muted"> · ауд.</span> {row.get('Аудитория','')}
+                      <span class="muted">{row.get('Преподаватель', '')}</span>
+                      <span class="muted"> · ауд.</span> {row.get('Аудитория', '')}
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -476,18 +552,22 @@ admin_ok = is_admin()
 
 repo = st.secrets.get("GITHUB_REPO", "")
 branch = st.secrets.get("GITHUB_BRANCH", "main")
-path = st.secrets.get("GITHUB_FILE_PATH", "data/latest.xlsx")
 
-# Top line: help + updated
+# Header
 c_hdr1, c_hdr2, c_hdr3 = st.columns([3, 2, 1.4])
 
 with c_hdr1:
-    st.markdown('<div class="smallcap">Откройте ссылку — расписание будет показано автоматически. '
-                'Админ обновляет файл через панель слева.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="smallcap">Откройте ссылку — расписание будет показано автоматически. '
+        'Админ обновляет комплект файлов через панель слева.</div>',
+        unsafe_allow_html=True
+    )
 
 with c_hdr2:
     try:
-        dt_utc = gh_get_latest_file_commit_datetime(repo, branch, path)
+        dt_utc = gh_get_latest_file_commit_datetime(repo, branch, "data/latest.json")
+        if dt_utc is None:
+            dt_utc = gh_get_latest_file_commit_datetime(repo, branch, "data/latest.xlsx")
         if dt_utc:
             dt_local_show = dt_utc.astimezone(TZ)
             st.markdown(
@@ -500,23 +580,57 @@ with c_hdr2:
 with c_hdr3:
     st.session_state["ui_mobile"] = st.toggle("📱 Мобильный режим", value=st.session_state["ui_mobile"])
 
-# Admin upload (sidebar)
+# Admin upload
 if admin_ok:
     st.sidebar.markdown("### ⬆️ Обновить расписание")
-    new_file = st.sidebar.file_uploader("Загрузите Excel (.xlsx)", type=["xlsx"], key="admin_uploader")
-    if new_file and st.sidebar.button("Опубликовать"):
+    new_files = st.sidebar.file_uploader(
+        "Загрузите файлы расписания (.xlsx)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="admin_uploader_multi"
+    )
+
+    if new_files and st.sidebar.button("Опубликовать комплект"):
         try:
-            content = new_file.getvalue()
+            df_all, parse_errors = parse_multiple_uploaded_schedules(new_files)
+
+            df_json = df_all.copy()
+            df_json["Дата"] = df_json["Дата"].dt.strftime("%Y-%m-%d")
+            json_bytes = df_json.to_json(orient="records", force_ascii=False).encode("utf-8")
+
+            xlsx_buffer = BytesIO()
+            with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+                df_all.to_excel(writer, index=False, sheet_name="schedule")
+                if parse_errors:
+                    pd.DataFrame({"Ошибки": parse_errors}).to_excel(writer, index=False, sheet_name="errors")
+            xlsx_bytes = xlsx_buffer.getvalue()
+
             gh_put_file(
                 repo=repo,
-                path=path,
+                path="data/latest.xlsx",
                 branch=branch,
-                content_bytes=content,
-                message="Update schedule (latest.xlsx) via Streamlit app"
+                content_bytes=xlsx_bytes,
+                message="Update merged schedule (latest.xlsx)"
             )
-            st.sidebar.success("✅ Расписание обновлено!")
+
+            gh_put_file(
+                repo=repo,
+                path="data/latest.json",
+                branch=branch,
+                content_bytes=json_bytes,
+                message="Update merged schedule (latest.json)"
+            )
+
+            st.sidebar.success(f"✅ Опубликовано записей: {len(df_all)}")
+
+            if parse_errors:
+                st.sidebar.warning("Часть файлов не удалось прочитать:")
+                for err in parse_errors:
+                    st.sidebar.write(f"— {err}")
+
             st.cache_data.clear()
             st.rerun()
+
         except Exception as e:
             st.sidebar.error(f"Ошибка публикации: {e}")
 
@@ -524,20 +638,18 @@ if admin_ok:
 st.markdown("### 📄 Текущее расписание")
 
 try:
-    url = gh_raw_url(repo, branch, path)
-    xlsx_bytes = download_bytes(url)
-    df = parse_all_sheets(BytesIO(xlsx_bytes))
+    df = load_published_schedule(repo, branch)
 except Exception as e:
-    st.warning("Пока нет опубликованного файла расписания или он недоступен.")
+    st.warning("Пока нет опубликованного расписания или оно недоступно.")
     st.caption(f"Детали: {e}")
     st.stop()
 
-# Prepare "my teacher" / quick actions
+# Session filters
 today_local = datetime.now(TZ).date()
 tomorrow_local = today_local + timedelta(days=1)
 
 if "quick_mode" not in st.session_state:
-    st.session_state["quick_mode"] = "all"  # all | today | tomorrow | my_today | my_tomorrow
+    st.session_state["quick_mode"] = "all"
 if "my_teacher" not in st.session_state:
     st.session_state["my_teacher"] = ""
 
@@ -545,23 +657,20 @@ teachers_all = sorted([t for t in df["Преподаватель"].unique().toli
 
 with st.sidebar:
     st.markdown("### 🙋 Мой преподаватель")
-    # allow typing and matching
     typed = st.text_input("Введите фамилию/имя (поиск)", value=st.session_state["my_teacher"])
-    # find best matches (contains)
     typed_l = typed.strip().lower()
     candidates = teachers_all
     if typed_l:
         candidates = [t for t in teachers_all if typed_l in t.lower()]
-    # if candidates too many, keep first 50
     candidates = candidates[:50] if len(candidates) > 50 else candidates
     chosen = st.selectbox("Выберите из списка", options=[""] + candidates, index=0)
     if st.button("💾 Сохранить моего преподавателя"):
         st.session_state["my_teacher"] = chosen if chosen else typed
         st.success("Сохранено для текущей сессии")
 
-st.success(f"Записей: {len(df)} | Листов: {df['Лист'].nunique()}")
+st.success(f"Записей: {len(df)} | Групп: {df['Группа'].nunique()}")
 
-# Quick buttons row (bigger on mobile)
+# Quick buttons
 btn_class = "bigbtn" if st.session_state["ui_mobile"] else ""
 b1, b2, b3, b4, b5 = st.columns([1.2, 1.2, 1.7, 1.7, 1.2])
 
@@ -595,27 +704,26 @@ with b5:
         st.session_state["quick_mode"] = "all"
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Filters layout: compact in mobile
+# Filters
 if st.session_state["ui_mobile"]:
     col1, col2 = st.columns([1.2, 2.2])
     mode = col1.selectbox("Режим", ["Всё", "По преподавателю", "По группе"])
     query = col2.text_input("Поиск (фамилия / предмет / ауд.)")
-    # Sheets and day filters go to expander
-    with st.expander("Фильтры (дни / листы)"):
+    with st.expander("Фильтры (дни / группы)"):
         days = sorted([d for d in df["День"].unique().tolist() if d])
         day_filter = st.multiselect("Дни недели", options=days, default=[])
-        sheets = sorted(df["Лист"].unique().tolist())
-        sheet_filter = st.multiselect("Листы", options=sheets, default=sheets)
+        groups_all = sorted([g for g in df["Группа"].unique().tolist() if g])
+        group_filter = st.multiselect("Группы", options=groups_all, default=groups_all)
 else:
     col1, col2, col3, col4 = st.columns([1.4, 1.7, 2.6, 2.6])
     mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
     days = sorted([d for d in df["День"].unique().tolist() if d])
     day_filter = col2.multiselect("Дни недели", options=days, default=[])
-    sheets = sorted(df["Лист"].unique().tolist())
-    sheet_filter = col3.multiselect("Листы", options=sheets, default=sheets)
+    groups_all = sorted([g for g in df["Группа"].unique().tolist() if g])
+    group_filter = col3.multiselect("Группы", options=groups_all, default=groups_all)
     query = col4.text_input("Поиск (фамилия / предмет / аудитория / группа)")
 
-# Apply filters + quick modes
+# Apply filters
 view = df.copy()
 
 def apply_date_filter(frame: pd.DataFrame, which: str) -> pd.DataFrame:
@@ -634,18 +742,16 @@ if qm in ("my_today", "my_tomorrow"):
     myt = (st.session_state.get("my_teacher") or "").strip()
     if not myt:
         st.warning("Сначала выберите и сохраните 'Мой преподаватель' в боковой панели.")
-        # still show all, but no my-filter
     else:
         view = view[view["Преподаватель"].astype(str).str.strip() == myt]
         view = apply_date_filter(view, "today" if qm == "my_today" else "tomorrow")
 
-# day/sheet filters
 if 'day_filter' in locals() and day_filter:
     view = view[view["День"].isin(day_filter)]
-if 'sheet_filter' in locals() and sheet_filter:
-    view = view[view["Лист"].isin(sheet_filter)]
 
-# query filter
+if 'group_filter' in locals() and group_filter:
+    view = view[view["Группа"].isin(group_filter)]
+
 if query.strip():
     q = query.strip().lower()
     mask = (
@@ -653,40 +759,40 @@ if query.strip():
         view["Дисциплина"].str.lower().str.contains(q, na=False) |
         view["Аудитория"].str.lower().str.contains(q, na=False) |
         view["Группа"].str.lower().str.contains(q, na=False) |
-        view["Лист"].str.lower().str.contains(q, na=False)
+        view["Подгруппа"].str.lower().str.contains(q, na=False) |
+        view["Источник"].str.lower().str.contains(q, na=False)
     )
     view = view[mask]
 
-# mode-specific selection
 if mode == "По преподавателю":
     teachers = sorted([t for t in view["Преподаватель"].unique().tolist() if str(t).strip()])
-    teacher = st.selectbox("Преподаватель", options=teachers)
-    view = view[view["Преподаватель"] == teacher]
+    if teachers:
+        teacher = st.selectbox("Преподаватель", options=teachers)
+        view = view[view["Преподаватель"] == teacher]
 elif mode == "По группе":
     groups = sorted([g for g in view["Группа"].unique().tolist() if str(g).strip()])
-    group = st.selectbox("Группа", options=groups)
-    view = view[view["Группа"] == group]
-elif mode == "Всё":
-    pass
+    if groups:
+        group = st.selectbox("Группа", options=groups)
+        view = view[view["Группа"] == group]
 
-# Tabs: on mobile default to Days
+# Tabs
 tab_days, tab_table, tab_cal = st.tabs(["📅 По дням", "📋 Таблица", "🗓️ Календарь"])
 
 with tab_days:
     if view.empty:
         st.info("Ничего не найдено по выбранным фильтрам.")
     else:
-        # Compact cards on mobile
         render_day_cards(view, compact=st.session_state["ui_mobile"])
 
 with tab_table:
     show = view.copy()
     show["Дата"] = show["Дата"].dt.strftime("%d.%m.%Y")
-    # On mobile show fewer columns
     if st.session_state["ui_mobile"]:
         cols = ["Дата", "День", "Пара", "Группа", "Дисциплина", "Аудитория"]
     else:
-        cols = ["Лист", "Дата", "День", "Пара", "Группа", "Дисциплина", "Преподаватель", "Аудитория"]
+        cols = ["Дата", "День", "Пара", "Группа", "Подгруппа", "Дисциплина", "Преподаватель", "Аудитория", "Источник"]
+
+    cols = [c for c in cols if c in show.columns]
 
     st.dataframe(
         show[cols],
@@ -696,7 +802,7 @@ with tab_table:
 
 with tab_cal:
     st.write("Скачайте календарь и импортируйте в Google Calendar / Outlook.")
-    st.caption("Экспорт учитывает текущие фильтры (включая 'Мои пары сегодня/завтра').")
+    st.caption("Экспорт учитывает текущие фильтры, включая 'Мои пары сегодня/завтра'.")
 
     with st.expander("⏱️ Расписание пар (используется в ICS)"):
         st.markdown("""
